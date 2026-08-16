@@ -1,0 +1,72 @@
+name = "scape-chat-relay"
+main = "src/worker.ts"
+# 2026-04-07 enables auto-Close-frame replies and the modern DO storage default.
+compatibility_date = "2026-04-07"
+# Required by @cloudflare/vitest-pool-workers; harmless in production runtime.
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "RoomDurableObject"
+
+[[migrations]]
+tag = "v1"
+# SQLite-backed DOs are the modern default for new classes. The store is
+# REQUIRED by the platform for new DO classes but this Worker never reads
+# or writes it — scripts/check-invariants.mjs fails the build if any
+# ctx.storage access is ever introduced.
+new_sqlite_classes = ["RoomDurableObject"]
+
+# Per-IP WebSocket-upgrade rate limit, enforced in code (src/worker.ts) —
+# NOT dashboard prose, so every fork gets it. 60 upgrades/min per client IP
+# is far above any legitimate client (the Scape app reconnects with backoff,
+# a handful of rooms per user) but kills the flood/reconnect-cycling vector:
+# each accepted connection is seeded with a full 10-token message bucket, so
+# without this cap an attacker could cycle reconnects to mint fresh buckets
+# (~100 frames/s instead of the intended sustained 2/s). Counters live in
+# Cloudflare's ephemeral rate limiter — this Worker stores nothing.
+[[ratelimits]]
+name = "UPGRADES"
+namespace_id = "1001"
+
+[ratelimits.simple]
+limit = 60
+period = 60
+
+[observability]
+# STORES-NOTHING (load-bearing): observability is OFF by default. When on,
+# Cloudflare's automatic invocation logs record "the Request, Response, and
+# related metadata" — the request URL contains /room/<roomId> and the event
+# carries the client IP — and Workers Logs are RETAINED (3 days free plan /
+# 7 days paid). Persisting roomIds + IPs would contradict this relay's
+# stores-nothing guarantee, so the shipped default is no stored telemetry
+# at all. scripts/check-invariants.mjs fails the build if this default
+# regresses.
+#
+# Debugging a deploy? Flip enabled = true TEMPORARILY. invocation_logs
+# stays false below so request URLs/IPs are still never persisted — only
+# this Worker's own console.log lines are stored, and those are
+# identifier-free by design (event tag + close code + error class only;
+# see src/room.ts and the README threat model). `wrangler tail` also works
+# with observability off entirely (live stream, nothing stored).
+enabled = false
+
+[observability.logs]
+invocation_logs = false
+
+[vars]
+# Fail-mode for the upgrade limiter: any value other than "false" makes a
+# MISSING UPGRADES binding reject upgrades with 503 (a security control
+# that silently vanished is a broken deploy, not an availability event).
+# Runtime limiter errors and a missing CF-Connecting-IP header still fail
+# open — see src/admission.ts. Set "false" ONLY if you knowingly run on a
+# platform without the ratelimits binding. Guarded by check-invariants.mjs.
+REQUIRE_UPGRADE_LIMITER = "true"
+
+# Optional operator knobs (uncomment to override the defaults compiled into
+# src/room.ts). The room egress budget bounds worst-case relay cost per
+# room: every accepted frame charges bytes × fanout against a token bucket;
+# on exhaustion the frame is dropped and the sender receives
+# {"v":1,"type":"error","code":"room_rate_limit"}.
+# ROOM_EGRESS_CAPACITY_BYTES = "20971520"        # burst: 20 MiB
+# ROOM_EGRESS_REFILL_BYTES_PER_SEC = "10485760"  # sustained: 10 MiB/s

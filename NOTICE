@@ -1,0 +1,12 @@
+scape-chat-relay
+Copyright 2026 Scape Labs, Inc.
+
+This product includes software developed for the Scape application
+(https://scape.work).
+
+"Scape" and associated logos are trademarks of their respective owner;
+this license grants rights to the code only, not to any trademark.
+
+The design was informed by the architecture of
+cloudflare/workers-chat-demo (BSD-licensed) as a reference; no code from
+that project is included in this product.

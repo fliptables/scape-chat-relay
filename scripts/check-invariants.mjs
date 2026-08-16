@@ -1,0 +1,446 @@
+#!/usr/bin/env node
+/**
+ * Stores-nothing + contract invariant guard — STRUCTURAL edition.
+ *
+ * Runs before the vitest suite (`npm test`) and fails the build when the
+ * relay's load-bearing guarantees regress. Both configuration languages
+ * are parsed for real (no regex scanning): wrangler.toml through a TOML
+ * parser with every key path walked, TypeScript through the compiler AST
+ * over the module graph built from the configured entry point.
+ *
+ * WHAT THIS GUARD ENFORCES — exactly, no more:
+ *  1. No Durable Object storage / alarms / cache / timer access in any
+ *     module reachable from the entry point (or present under src/):
+ *     property access, computed access with string-literal-TYPED keys
+ *     (`const k = "storage" as const; ctx[k]`), and destructuring —
+ *     computed string access whose key type can't be resolved to a
+ *     literal is rejected outright, so unresolvable access can't hide.
+ *  2. The module graph is the real bundle boundary: static imports and
+ *     literal dynamic imports are followed wherever they point (incl.
+ *     outside src/); `require` is forbidden entirely (this is an ESM
+ *     worker) and non-literal dynamic import specifiers are rejected.
+ *  3. Console output is CENTRALIZED: `console` may appear only in
+ *     src/log.ts, whose four call shapes are verified structurally and
+ *     whose two sanitizers are pinned to RUNTIME-semantic bodies —
+ *     errClass must be the fixed-literal-or-typeof form (never the
+ *     mutable `err.name`), and the ws_close value must be the verbatim
+ *     `Number.isInteger(code) ? code : -1` sanitizer with `code`
+ *     symbol-resolving to logWsClose's own parameter (type annotations
+ *     alone are erased by `as` casts, so the guard demands the runtime
+ *     check). log.ts must import nothing. Everywhere else, any
+ *     `console` reference fails. The runtime behavior itself is proven
+ *     by tainted-input unit tests in test/log.spec.ts.
+ *  4. Reflection escape hatches are banned in the graph: globalThis,
+ *     Reflect, eval, Function, require.
+ *  5. wrangler.toml carries no storage-shaped binding under ANY key path
+ *     (quoting and [[env.*]] qualification are normalized by the
+ *     parser); hardened defaults (observability off, invocation_logs
+ *     false, REQUIRE_UPGRADE_LIMITER "true") hold at top level and in
+ *     every env override; no wrangler.json/jsonc exists to bypass the
+ *     audited file.
+ *  6. Contract constants (route regex, frame cap, peer cap, bucket
+ *     parameters) exist as declarations with exact initializers.
+ *
+ * Every class above is RED-proven by the executable mutation battery
+ * (scripts/check-guard-battery.mjs, run in `npm test`).
+ *
+ * WHAT THIS GUARD DOES NOT CLAIM: it is drift-protection plus the
+ * enumerated evasion-class closures — not a sandbox. A deliberately
+ * malicious committer writing obfuscated exfiltration is a code-review
+ * matter; the guard's job is to make every accidental regression and
+ * every known cheap evasion fail the build loudly.
+ *
+ * INVARIANTS_ROOT env var overrides the audited root (used by the
+ * battery to point the guard at mutated copies); dependencies still
+ * resolve from this script's own location.
+ */
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { parse as parseToml } from "smol-toml";
+import ts from "typescript";
+
+const relayRoot = process.env.INVARIANTS_ROOT
+  ? resolve(process.env.INVARIANTS_ROOT)
+  : join(dirname(fileURLToPath(import.meta.url)), "..");
+const failures = [];
+const fail = (msg) => failures.push(msg);
+
+// ============================ wrangler.toml ============================
+
+for (const alt of ["wrangler.json", "wrangler.jsonc"]) {
+  if (existsSync(join(relayRoot, alt))) {
+    fail(`${alt} exists — wrangler.toml must be the single config file this guard audits`);
+  }
+}
+
+const FORBIDDEN_BINDING_KEYS = new Set([
+  "kv_namespaces",
+  "r2_buckets",
+  "d1_databases",
+  "analytics_engine_datasets",
+  "queues",
+  "services",
+  "hyperdrive",
+  "vectorize",
+  "send_email",
+  "browser",
+  "ai",
+]);
+
+let config;
+try {
+  config = parseToml(readFileSync(join(relayRoot, "wrangler.toml"), "utf8"));
+} catch (err) {
+  fail(`wrangler.toml failed to parse: ${err.message}`);
+  config = {};
+}
+
+function walkKeys(node, path) {
+  if (Array.isArray(node)) {
+    for (const item of node) walkKeys(item, path);
+    return;
+  }
+  if (node === null || typeof node !== "object") return;
+  for (const [key, value] of Object.entries(node)) {
+    if (FORBIDDEN_BINDING_KEYS.has(key)) {
+      fail(`wrangler.toml: storage-shaped binding "${[...path, key].join(".")}" is forbidden (stores-nothing)`);
+    }
+    walkKeys(value, [...path, key]);
+  }
+}
+walkKeys(config, []);
+
+function checkDefaults(scope, label) {
+  const obs = scope.observability;
+  if (label === "top-level") {
+    if (!obs || obs.enabled !== false) {
+      fail(`wrangler.toml (${label}): [observability] enabled must be false (stores-nothing default)`);
+    }
+    if (!obs?.logs || obs.logs.invocation_logs !== false) {
+      fail(
+        `wrangler.toml (${label}): [observability.logs] invocation_logs = false is required — ` +
+          "Cloudflare's invocation logs persist the request URL (roomId) + client IP",
+      );
+    }
+    if (scope.vars?.REQUIRE_UPGRADE_LIMITER !== "true") {
+      fail(`wrangler.toml (${label}): [vars] REQUIRE_UPGRADE_LIMITER = "true" must ship (fail-closed default)`);
+    }
+  } else {
+    if (obs?.enabled === true) fail(`wrangler.toml (${label}): observability enabled in env override`);
+    if (obs?.logs && obs.logs.invocation_logs !== false) {
+      fail(`wrangler.toml (${label}): invocation_logs weakened in env override`);
+    }
+    if (scope.vars && scope.vars.REQUIRE_UPGRADE_LIMITER !== "true") {
+      fail(`wrangler.toml (${label}): REQUIRE_UPGRADE_LIMITER weakened in env override`);
+    }
+  }
+}
+checkDefaults(config, "top-level");
+for (const [envName, envScope] of Object.entries(config.env ?? {})) {
+  if (envScope && typeof envScope === "object") checkDefaults(envScope, `env.${envName}`);
+}
+
+// ======================= TypeScript module graph =======================
+
+const entryRel = typeof config.main === "string" ? config.main : "src/worker.ts";
+const entry = resolve(relayRoot, entryRel);
+if (!existsSync(entry)) fail(`configured entry point ${entryRel} does not exist`);
+
+const program = ts.createProgram([entry], {
+  target: ts.ScriptTarget.ES2022,
+  module: ts.ModuleKind.ES2022,
+  moduleResolution: ts.ModuleResolutionKind.Bundler,
+  noEmit: true,
+  types: [],
+});
+
+const graphFiles = program
+  .getSourceFiles()
+  .filter((sf) => resolve(sf.fileName).startsWith(relayRoot + sep) && !sf.fileName.includes("node_modules"));
+const graphPaths = new Set(graphFiles.map((sf) => resolve(sf.fileName)));
+const srcOnly = readdirSync(join(relayRoot, "src"), { recursive: true, withFileTypes: true })
+  .filter((d) => d.isFile() && d.name.endsWith(".ts"))
+  .map((d) => resolve(join(d.parentPath ?? d.path, d.name)))
+  .filter((p) => !graphPaths.has(p));
+const extraProgram = srcOnly.length
+  ? ts.createProgram(srcOnly, { target: ts.ScriptTarget.ES2022, noEmit: true, types: [] })
+  : null;
+const allFiles = [
+  ...graphFiles.map((sf) => ({ sf, chk: program.getTypeChecker() })),
+  ...(extraProgram
+    ? extraProgram
+        .getSourceFiles()
+        .filter((sf) => srcOnly.includes(resolve(sf.fileName)))
+        .map((sf) => ({ sf, chk: extraProgram.getTypeChecker() }))
+    : []),
+];
+if (allFiles.length < 5) {
+  fail(`expected ≥5 modules in the scan set, found ${allFiles.length} — graph construction broken?`);
+}
+
+const FORBIDDEN_MEMBERS = new Set(["storage", "setAlarm", "getAlarm", "deleteAlarm"]);
+const FORBIDDEN_GLOBALS = new Set([
+  "caches",
+  "setTimeout",
+  "setInterval",
+  "globalThis",
+  "eval",
+  "Function",
+  "Reflect",
+  "require",
+]);
+const LOGGER_MODULE = resolve(relayRoot, "src", "log.ts");
+
+function rel(sf) {
+  return resolve(sf.fileName).slice(relayRoot.length + 1);
+}
+function loc(sf, node) {
+  const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+  return `${rel(sf)}:${line + 1}`;
+}
+function stringValueOf(node) {
+  return ts.isStringLiteralLike(node) ? node.text : null;
+}
+
+/// Resolve a computed key to a string, using the TYPE when the syntax
+/// isn't a literal: `const k = "storage" as const; ctx[k]` has a
+/// string-literal type carrying the value. Returns:
+///   { kind: "string", value }  — resolved string key
+///   { kind: "number" }         — numeric index (allowed)
+///   { kind: "opaque" }         — unresolvable (rejected by callers)
+function resolveKey(expr, chk) {
+  const lit = stringValueOf(expr);
+  if (lit !== null) return { kind: "string", value: lit };
+  const type = chk.getTypeAtLocation(expr);
+  if (type.isStringLiteral()) return { kind: "string", value: type.value };
+  if (type.flags & ts.TypeFlags.NumberLike) return { kind: "number" };
+  return { kind: "opaque" };
+}
+
+/// The four reviewed log shapes, checked ONLY inside src/log.ts. The
+/// `code` shorthand must resolve by symbol to the numeric parameter of
+/// logWsClose itself; `err` values must be calls to the verified
+/// errClass. Everywhere outside log.ts, ANY console reference fails.
+function isAllowedConsoleCall(call, sf, chk) {
+  if (!ts.isPropertyAccessExpression(call.expression)) return false;
+  const method = call.expression.name.text;
+  if (call.arguments.length !== 1) return false;
+  const arg = call.arguments[0];
+  if (!ts.isObjectLiteralExpression(arg)) return false;
+  const props = new Map();
+  for (const p of arg.properties) {
+    if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name)) props.set(p.name.text, p);
+    else if (ts.isShorthandPropertyAssignment(p)) props.set(p.name.text, p);
+    else return false;
+  }
+  const evt = props.get("evt");
+  const evtName = evt && ts.isPropertyAssignment(evt) ? stringValueOf(evt.initializer) : null;
+  const errIsErrClass = (p) =>
+    p &&
+    ts.isPropertyAssignment(p) &&
+    ts.isCallExpression(p.initializer) &&
+    ts.isIdentifier(p.initializer.expression) &&
+    p.initializer.expression.text === "errClass";
+
+  if (method === "log" && evtName === "room_budget_drop" && props.size === 1) return true;
+  if (method === "log" && evtName === "dead_peer_drop" && props.size === 2 && errIsErrClass(props.get("err"))) return true;
+  if (method === "error" && evtName === "ws_error" && props.size === 2 && errIsErrClass(props.get("err"))) return true;
+  if (method === "log" && evtName === "ws_close" && props.size === 2) {
+    // The value must be the exact RUNTIME integer sanitizer — a type
+    // annotation alone is erased by an `as` cast at a call site, so the
+    // guard demands `Number.isInteger(code) ? code : -1` verbatim, with
+    // `code` symbol-resolving to logWsClose's own parameter (a shadowing
+    // local fails).
+    const codeProp = props.get("code");
+    if (!codeProp || !ts.isPropertyAssignment(codeProp)) return false;
+    const init = codeProp.initializer;
+    if (init.getText(sf).replace(/\s+/g, " ") !== "Number.isInteger(code) ? code : -1") return false;
+    if (!ts.isConditionalExpression(init) || !ts.isIdentifier(init.whenTrue)) return false;
+    const sym = chk.getSymbolAtLocation(init.whenTrue);
+    const decl = sym?.valueDeclaration;
+    return (
+      decl !== undefined &&
+      ts.isParameter(decl) &&
+      ts.isFunctionDeclaration(decl.parent) &&
+      decl.parent.name?.getText(sf) === "logWsClose"
+    );
+  }
+  return false;
+}
+
+/// src/log.ts leaf-module checks: no imports (nothing to smuggle values
+/// through), and errClass's body is exactly the class-name-or-typeof
+/// form — its output domain is then closed for ANY input, so call-site
+/// arguments don't need policing.
+function checkLoggerModule(sf) {
+  for (const stmt of sf.statements) {
+    if (ts.isImportDeclaration(stmt) || ts.isImportEqualsDeclaration(stmt)) {
+      fail(`${rel(sf)}: the logger module must import nothing`);
+    }
+  }
+  const errClassDecl = sf.statements.find(
+    (s) => ts.isFunctionDeclaration(s) && s.name?.getText(sf) === "errClass",
+  );
+  if (!errClassDecl || !errClassDecl.body || errClassDecl.body.statements.length !== 1) {
+    fail(`${rel(sf)}: errClass must be a single-return function declaration`);
+    return;
+  }
+  const ret = errClassDecl.body.statements[0];
+  const retText =
+    ts.isReturnStatement(ret) && ret.expression
+      ? ret.expression.getText(sf).replace(/\s+/g, " ")
+      : null;
+  // NEVER `err.name`: Error.name is MUTABLE arbitrary text (a library or
+  // adversary can set it to request-derived content). Only our own fixed
+  // literal and the closed set of typeof strings are runtime-safe.
+  if (retText !== 'err instanceof Error ? "Error" : typeof err') {
+    fail(
+      `${rel(sf)}: errClass body drifted (found: ${retText ?? "not a return"}) — ` +
+        'must be exactly `err instanceof Error ? "Error" : typeof err`; its runtime-closed output domain ' +
+        "(fixed literal | typeof string) is what makes every log line identifier-free for ANY input",
+    );
+  }
+}
+
+for (const { sf, chk } of allFiles) {
+  const isLoggerModule = resolve(sf.fileName) === LOGGER_MODULE;
+  if (isLoggerModule) checkLoggerModule(sf);
+
+  const visit = (node) => {
+    // (1) storage-shaped member access: property, computed (with the key
+    // resolved through the type system), or destructuring.
+    if (ts.isPropertyAccessExpression(node) && FORBIDDEN_MEMBERS.has(node.name.text)) {
+      fail(`${loc(sf, node)}: forbidden member access ".${node.name.text}" (stores-nothing)`);
+    }
+    if (ts.isElementAccessExpression(node)) {
+      const key = resolveKey(node.argumentExpression, chk);
+      if (key.kind === "string" && FORBIDDEN_MEMBERS.has(key.value)) {
+        fail(`${loc(sf, node)}: forbidden computed access ["${key.value}"] (stores-nothing)`);
+      } else if (key.kind === "opaque") {
+        fail(
+          `${loc(sf, node)}: computed access with an unresolvable string key — ` +
+            "use static property access or a const string-literal key so the guard can audit it",
+        );
+      }
+    }
+    if (ts.isBindingElement(node)) {
+      if (node.propertyName && ts.isComputedPropertyName(node.propertyName)) {
+        const key = resolveKey(node.propertyName.expression, chk);
+        if (key.kind === "string" && FORBIDDEN_MEMBERS.has(key.value)) {
+          fail(`${loc(sf, node)}: forbidden computed destructuring of "${key.value}" (stores-nothing)`);
+        } else if (key.kind !== "number" && key.kind !== "string") {
+          fail(`${loc(sf, node)}: computed destructuring with an unresolvable key`);
+        }
+      } else {
+        const name = (node.propertyName ?? node.name).getText(sf).replace(/^["']|["']$/g, "");
+        if (FORBIDDEN_MEMBERS.has(name)) {
+          fail(`${loc(sf, node)}: forbidden destructuring of "${name}" (stores-nothing)`);
+        }
+      }
+    }
+    // (2) module-graph escape hatches: require is forbidden outright
+    // (ESM worker; esbuild would bundle a static require the TS graph
+    // can't see), and dynamic import must use a literal specifier
+    // (literal ones are part of the graph; opaque ones aren't auditable).
+    if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+      stringValueOf(node.arguments[0]) === null
+    ) {
+      fail(`${loc(sf, node)}: dynamic import with a non-literal specifier escapes the audited graph`);
+    }
+    // (3) forbidden globals incl. reflection escape hatches + require.
+    if (ts.isIdentifier(node) && FORBIDDEN_GLOBALS.has(node.text)) {
+      const p = node.parent;
+      const isDeclarationName =
+        (ts.isPropertyAccessExpression(p) && p.name === node) ||
+        ts.isPropertySignature(p) ||
+        ts.isMethodSignature(p);
+      if (!isDeclarationName) {
+        fail(`${loc(sf, node)}: forbidden global "${node.text}" (stores-nothing / no-timers / no-reflection)`);
+      }
+    }
+    // (4) console: forbidden everywhere except src/log.ts, and there only
+    // as the receiver of one of the four reviewed call shapes.
+    if (ts.isIdentifier(node) && node.text === "console") {
+      const access = node.parent;
+      const call = access?.parent;
+      const ok =
+        isLoggerModule &&
+        ts.isPropertyAccessExpression(access) &&
+        access.expression === node &&
+        call !== undefined &&
+        ts.isCallExpression(call) &&
+        call.expression === access &&
+        isAllowedConsoleCall(call, sf, chk);
+      if (!ok) {
+        fail(
+          isLoggerModule
+            ? `${loc(sf, node)}: console call in the logger does not match a reviewed shape`
+            : `${loc(sf, node)}: console is forbidden outside src/log.ts — add a reviewed function to the logger instead`,
+        );
+      }
+    }
+    // (5) auto-response pairs must be exactly ping/pong.
+    if (ts.isNewExpression(node) && node.expression.getText(sf) === "WebSocketRequestResponsePair") {
+      const [a, b] = node.arguments ?? [];
+      if (stringValueOf(a) !== "ping" || stringValueOf(b) !== "pong") {
+        fail(`${loc(sf, node)}: auto-response pair other than ("ping","pong") is forbidden`);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+}
+
+// ========================= contract literals ==========================
+const CONTRACT = [
+  ["MAX_FRAME_BYTES", "64 * 1024", "64 KiB frame cap"],
+  ["MAX_PEERS_PER_ROOM", "25", "25-peer room cap"],
+  ["BUCKET_CAPACITY", "10", "per-conn burst capacity"],
+  ["REFILL_PER_SEC", "2", "per-conn sustained rate"],
+  ["WIRE_VERSION", "2", "relay-authored envelope version (clients drop v≠supportedVersion as .unknown)"],
+];
+const declInits = new Map();
+for (const { sf } of allFiles) {
+  const collect = (node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      declInits.set(node.name.text, node.initializer.getText(sf).replace(/\s+/g, " "));
+    }
+    ts.forEachChild(node, collect);
+  };
+  collect(sf);
+}
+for (const [name, expected, what] of CONTRACT) {
+  if (declInits.get(name) !== expected) {
+    fail(
+      `contract constant ${name} (${what}) missing or drifted (found: ${declInits.get(name) ?? "absent"}) — ` +
+        "this value is compiled into the Scape client; changing it is a coordinated contract bump",
+    );
+  }
+}
+const routeInit = declInits.get("ROUTE");
+if (routeInit !== String.raw`/^\/room\/([0-9a-f]{64})$/`) {
+  fail(`contract constant ROUTE (legacy roomId route regex, dual window) missing or drifted (found: ${routeInit ?? "absent"})`);
+}
+// Dual-window intake contract (IT-613 roomId-off-URL migration): the
+// header mechanism's literals are compiled into the Swift client.
+const DUAL_INTAKE = [
+  ["CONNECT_PATH", '"/connect"', "header-mechanism connect path"],
+  ["ROOM_HEADER", '"X-Scape-Room"', "roomId header name"],
+  ["ROOM_ID", String.raw`/^[0-9a-f]{64}$/`, "roomId value grammar"],
+];
+for (const [name, expected, what] of DUAL_INTAKE) {
+  if (declInits.get(name) !== expected) {
+    fail(`contract constant ${name} (${what}) missing or drifted (found: ${declInits.get(name) ?? "absent"})`);
+  }
+}
+
+// ============================== verdict ===============================
+if (failures.length > 0) {
+  console.error("check-invariants: FAILED\n");
+  for (const f of failures) console.error(`  ✘ ${f}`);
+  process.exit(1);
+}
+console.log("check-invariants: OK (stores-nothing + contract invariants hold, structurally)");
