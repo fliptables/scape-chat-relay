@@ -19,8 +19,9 @@
  * the codex round-5 closures (import-equals, process/getBuiltinModule,
  * cloudflare:workers namespace de-aliasing), and the codex round-6
  * closures (AbortSignal.timeout, string-literal import spellings,
- * round-7's constructor laundering, and round-8's descriptor/prototype
- * laundering) plus adjacent variants — each RED-proven individually.
+ * round-7's constructor laundering, round-8's descriptor/prototype
+ * laundering, and round-9's createRequire) plus adjacent variants —
+ * each RED-proven individually.
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -269,6 +270,14 @@ const MUTATIONS = [
     "export const rf3 = (x: object) => Object.getOwnPropertyDescriptors(x);\n")],
   ["RF4 legacy __proto__ accessor", () => append("src/worker.ts",
     "export const rf4 = (x: object) => (x as any).__proto__;\n")],
+  // ---- codex round-9: node:module.createRequire hands back a live
+  //      require that loads node:timers (verified against workerd).
+  //      MD1 is the end-to-end handle; MD2 pins the bare spelling. ----
+  ["MD1 createRequire via node:module", () => append("src/worker.ts",
+    'import { createRequire as makeRequire } from "node:module";\n' +
+    'export const md1 = () => (makeRequire("/worker.js")("node:timers") as any).setTimeout;\n')],
+  ["MD2 bare module specifier", () => append("src/worker.ts",
+    'import * as mod from "module";\nexport const md2 = () => mod;\n')],
 ];
 
 resetCopy();

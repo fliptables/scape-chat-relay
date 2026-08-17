@@ -26,12 +26,13 @@
  *     node_modules is recognized only as an exact path segment, so a
  *     look-alike filename ("node_modules-escape.ts") can't borrow the
  *     exclusion. The node:timers / node:timers/promises / node:process
- *     modules are banned in every import form (a namespace import would
- *     hide setTimeout/setInterval in property-name position;
- *     process.getBuiltinModule would re-expose them with no import at
- *     all), import-equals (`import x = require(...)`) is banned as a
- *     syntax, and cloudflare:workers may be imported ONLY via named
- *     bindings — its namespace object re-exports `scheduler`.
+ *     / node:module modules are banned in every import form (a
+ *     namespace import would hide setTimeout/setInterval in
+ *     property-name position; process.getBuiltinModule and
+ *     module.createRequire would re-expose every builtin with no
+ *     further import), import-equals (`import x = require(...)`) is
+ *     banned as a syntax, and cloudflare:workers may be imported ONLY
+ *     via named bindings — its namespace object re-exports `scheduler`.
  *  3. Console output is CENTRALIZED: `console` may appear only in
  *     src/log.ts, whose four call shapes are verified structurally and
  *     whose two sanitizers are pinned to RUNTIME-semantic bodies —
@@ -303,8 +304,11 @@ const FORBIDDEN_GLOBALS = new Set([
 // would put setTimeout/setInterval in the exempted property-name
 // position — outside the identifier ban above (codex round-4 finding).
 // node:process joins them because process.getBuiltinModule re-exposes
-// every builtin with no further import (codex round-5 finding).
-const FORBIDDEN_MODULE_SPECIFIERS = /^(node:)?(timers(\/promises)?|process)$/;
+// every builtin with no further import (codex round-5 finding), and
+// node:module because createRequire() hands back a live require that
+// loads node:timers — verified live against workerd (codex round-9
+// finding). This relay has no legitimate module-loader use.
+const FORBIDDEN_MODULE_SPECIFIERS = /^(node:)?(timers(\/promises)?|process|module)$/;
 
 const LOGGER_MODULE = resolve(relayRoot, "src", "log.ts");
 
@@ -485,7 +489,7 @@ for (const { sf, chk } of allFiles) {
       fail(
         `${loc(sf, node)}: forbidden module import "${moduleSpec}" — ` +
           "node:timers re-exposes setTimeout/setInterval behind a namespace receiver, and " +
-          "node:process re-exposes every builtin via getBuiltinModule (no-timers)",
+          "node:process (getBuiltinModule) / node:module (createRequire) re-expose every builtin (no-timers)",
       );
     }
     // (2d′) string-literal import/export spellings: `import { "scheduler"
