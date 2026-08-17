@@ -14,9 +14,11 @@
  * keys), the review-round additions (self/scheduler global aliases,
  * one bare mutation per banned reflection/timer name, out-of-root module
  * resolution, logpush/tail_consumers, doc'd wire-version drift,
- * Retry-After ↔ limiter-period lockstep), and the codex round-4 closures
- * (timer-module namespace imports, node_modules-segment spoofing) plus
- * adjacent variants — each RED-proven individually.
+ * Retry-After ↔ limiter-period lockstep), the codex round-4 closures
+ * (timer-module namespace imports, node_modules-segment spoofing), and
+ * the codex round-5 closures (import-equals, process/getBuiltinModule,
+ * cloudflare:workers namespace de-aliasing) plus adjacent variants —
+ * each RED-proven individually.
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -219,6 +221,24 @@ const MUTATIONS = [
     writeFileSync(join(work, "node_modules-escape.ts"), "export const escaped = 2;\n");
     append("src/worker.ts", 'import { escaped as esc2 } from "../../node_modules-escape";\nexport const b7 = esc2;\n');
   }],
+  // ---- codex round-5: remaining timer-closure family ----
+  ["TM3 import-equals of node:timers", () => append("src/worker.ts",
+    'import timers3 = require("node:timers");\nexport const tm3 = (f: () => void) => timers3.setTimeout(f, 1000);\n')],
+  ["PR1 bare process", () => append("src/worker.ts",
+    'export const pr1 = () => process.getBuiltinModule("node:timers");\n')],
+  // PR2 keeps its body innocuous (`.env`, not `.getBuiltinModule`) so it
+  // isolates the node:process SPECIFIER ban rather than the member ban.
+  ["PR2 namespace import of node:process", () => append("src/worker.ts",
+    'import * as proc from "node:process";\nexport const pr2 = () => proc.env;\n')],
+  // PR3 isolates the getBuiltinModule MEMBER ban: the receiver is an
+  // ordinary parameter, so neither the `process` global nor the module
+  // specifiers fire — only the FORBIDDEN_MEMBERS entry does.
+  ["PR3 getBuiltinModule on a laundered receiver", () => append("src/worker.ts",
+    'export const pr3 = (p: { getBuiltinModule(id: string): unknown }) => p.getBuiltinModule("node:timers");\n')],
+  ["CW1 namespace import of cloudflare:workers", () => append("src/worker.ts",
+    'import * as w from "cloudflare:workers";\nexport const cw1 = () => w.scheduler.wait(1000);\n')],
+  ["CW2 dynamic import of cloudflare:workers", () => append("src/worker.ts",
+    'export const cw2 = () => import("cloudflare:workers");\n')],
 ];
 
 resetCopy();

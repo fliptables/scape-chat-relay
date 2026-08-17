@@ -25,9 +25,13 @@
  *     exclusions; deliberately out of scope, see "not a sandbox").
  *     node_modules is recognized only as an exact path segment, so a
  *     look-alike filename ("node_modules-escape.ts") can't borrow the
- *     exclusion. The node:timers / node:timers/promises modules are
- *     banned in every import form — a namespace import would otherwise
- *     hide setTimeout/setInterval in property-name position.
+ *     exclusion. The node:timers / node:timers/promises / node:process
+ *     modules are banned in every import form (a namespace import would
+ *     hide setTimeout/setInterval in property-name position;
+ *     process.getBuiltinModule would re-expose them with no import at
+ *     all), import-equals (`import x = require(...)`) is banned as a
+ *     syntax, and cloudflare:workers may be imported ONLY via named
+ *     bindings — its namespace object re-exports `scheduler`.
  *  3. Console output is CENTRALIZED: `console` may appear only in
  *     src/log.ts, whose four call shapes are verified structurally and
  *     whose two sanitizers are pinned to RUNTIME-semantic bodies —
@@ -40,8 +44,9 @@
  *     `console` reference fails. The runtime behavior itself is proven
  *     by tainted-input unit tests in test/log.spec.ts.
  *  4. Reflection/global escape hatches are banned in the graph:
- *     globalThis, self, scheduler, setImmediate, Reflect, eval,
- *     Function, require.
+ *     globalThis, self, scheduler, setImmediate, process, Reflect,
+ *     eval, Function, require — plus the getBuiltinModule member on
+ *     any receiver.
  *     The property-name exemption is revoked when the receiver is
  *     `self`/`globalThis`, so `self.eval(...)` / `globalThis.setTimeout`
  *     cannot slip through as "property names" — de-aliasing the global
@@ -228,7 +233,10 @@ if (allFiles.length < 5) {
   fail(`expected ≥5 modules in the scan set, found ${allFiles.length} — graph construction broken?`);
 }
 
-const FORBIDDEN_MEMBERS = new Set(["storage", "setAlarm", "getAlarm", "deleteAlarm"]);
+// getBuiltinModule (on ANY receiver) re-exposes node builtins — incl.
+// node:timers — with no import for the graph rules to see; workerd
+// implements it under nodejs_compat (codex round-5 finding).
+const FORBIDDEN_MEMBERS = new Set(["storage", "setAlarm", "getAlarm", "deleteAlarm", "getBuiltinModule"]);
 const FORBIDDEN_GLOBALS = new Set([
   "caches",
   "setTimeout",
@@ -244,17 +252,22 @@ const FORBIDDEN_GLOBALS = new Set([
   // `scheduler.wait()` is a timer in different clothing: it pins the DO
   // awake exactly like setTimeout, which the no-timer guarantee forbids.
   "scheduler",
+  // `process.getBuiltinModule("node:timers")` re-exposes timers with no
+  // import at all; nothing in a bindings-based Worker needs `process`.
+  "process",
   "eval",
   "Function",
   "Reflect",
   "require",
 ]);
-// Timer MODULES, banned in every import form (static, re-export,
+// Capability MODULES, banned in every import form (static, re-export,
 // dynamic): nodejs_compat exposes node:timers / node:timers/promises in
 // workerd, and a namespace import (`import * as t from "node:timers"`)
 // would put setTimeout/setInterval in the exempted property-name
 // position — outside the identifier ban above (codex round-4 finding).
-const FORBIDDEN_MODULE_SPECIFIERS = /^(node:)?timers(\/promises)?$/;
+// node:process joins them because process.getBuiltinModule re-exposes
+// every builtin with no further import (codex round-5 finding).
+const FORBIDDEN_MODULE_SPECIFIERS = /^(node:)?(timers(\/promises)?|process)$/;
 
 const LOGGER_MODULE = resolve(relayRoot, "src", "log.ts");
 
@@ -416,7 +429,14 @@ for (const { sf, chk } of allFiles) {
     ) {
       fail(`${loc(sf, node)}: dynamic import with a non-literal specifier escapes the audited graph`);
     }
-    // (2b) timer modules — see FORBIDDEN_MODULE_SPECIFIERS.
+    // (2b) import-equals is banned as a SYNTAX: `import x = require(...)`
+    // carries no `require` Identifier node (the ban above can't see it)
+    // and is a different AST shape than the import forms audited below —
+    // and this is an ESM worker, so it has no legitimate use.
+    if (ts.isImportEqualsDeclaration(node)) {
+      fail(`${loc(sf, node)}: import-equals (\`import x = require(...)\`) is forbidden — ESM worker; use a static import the guard can audit`);
+    }
+    // (2c) capability modules — see FORBIDDEN_MODULE_SPECIFIERS.
     const moduleSpec = ts.isImportDeclaration(node)
       ? stringValueOf(node.moduleSpecifier)
       : ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined
@@ -426,9 +446,30 @@ for (const { sf, chk } of allFiles) {
           : null;
     if (moduleSpec !== null && FORBIDDEN_MODULE_SPECIFIERS.test(moduleSpec)) {
       fail(
-        `${loc(sf, node)}: forbidden timer-module import "${moduleSpec}" — ` +
-          "node:timers re-exposes setTimeout/setInterval behind a namespace receiver (no-timers)",
+        `${loc(sf, node)}: forbidden module import "${moduleSpec}" — ` +
+          "node:timers re-exposes setTimeout/setInterval behind a namespace receiver, and " +
+          "node:process re-exposes every builtin via getBuiltinModule (no-timers)",
       );
+    }
+    // (2d) cloudflare:workers may be imported ONLY via named bindings:
+    // its module namespace object re-exports `scheduler`, so a
+    // namespace/default/dynamic/re-export form would de-alias the banned
+    // global into exempt property position (`w.scheduler.wait(...)`).
+    // Named bindings stay auditable — importing `scheduler` by name
+    // (renamed or not) trips the identifier ban above.
+    if (moduleSpec === "cloudflare:workers") {
+      const namedOnly =
+        ts.isImportDeclaration(node) &&
+        (node.importClause === undefined ||
+          (node.importClause.name === undefined &&
+            node.importClause.namedBindings !== undefined &&
+            ts.isNamedImports(node.importClause.namedBindings)));
+      if (!namedOnly) {
+        fail(
+          `${loc(sf, node)}: cloudflare:workers may only be imported via named bindings — ` +
+            'its namespace object re-exposes "scheduler" (no-timers)',
+        );
+      }
     }
     // (3) forbidden globals incl. reflection escape hatches + require.
     // Property-name position is exempt (`obj.storage` is the MEMBER
