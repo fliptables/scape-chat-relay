@@ -19,6 +19,10 @@
  *     literal dynamic imports are followed wherever they point (incl.
  *     outside src/); `require` is forbidden entirely (this is an ESM
  *     worker) and non-literal dynamic import specifiers are rejected.
+ *     Any module resolving OUTSIDE the repo root fails loudly — the
+ *     bundler would include it but the audit below couldn't see it
+ *     (node_modules and the TS default libs are the documented
+ *     exclusions; deliberately out of scope, see "not a sandbox").
  *  3. Console output is CENTRALIZED: `console` may appear only in
  *     src/log.ts, whose four call shapes are verified structurally and
  *     whose two sanitizers are pinned to RUNTIME-semantic bodies —
@@ -30,16 +34,24 @@
  *     check). log.ts must import nothing. Everywhere else, any
  *     `console` reference fails. The runtime behavior itself is proven
  *     by tainted-input unit tests in test/log.spec.ts.
- *  4. Reflection escape hatches are banned in the graph: globalThis,
- *     Reflect, eval, Function, require.
+ *  4. Reflection/global escape hatches are banned in the graph:
+ *     globalThis, self, scheduler, Reflect, eval, Function, require.
+ *     The property-name exemption is revoked when the receiver is
+ *     `self`/`globalThis`, so `self.eval(...)` / `globalThis.setTimeout`
+ *     cannot slip through as "property names" — de-aliasing the global
+ *     must not re-open a ban.
  *  5. wrangler.toml carries no storage-shaped binding under ANY key path
  *     (quoting and [[env.*]] qualification are normalized by the
  *     parser); hardened defaults (observability off, invocation_logs
- *     false, REQUIRE_UPGRADE_LIMITER "true") hold at top level and in
- *     every env override; no wrangler.json/jsonc exists to bypass the
- *     audited file.
+ *     false, no logpush, no tail_consumers, REQUIRE_UPGRADE_LIMITER
+ *     "true") hold at top level and in every env override; no
+ *     wrangler.json/jsonc exists to bypass the audited file.
  *  6. Contract constants (route regex, frame cap, peer cap, bucket
  *     parameters) exist as declarations with exact initializers.
+ *  7. Doc'd examples can't drift from the wire: every `"v":N` literal in
+ *     README.md / wrangler.toml matches WIRE_VERSION, and the 429
+ *     Retry-After hint in worker.ts stays in lockstep with
+ *     wrangler.toml's [ratelimits.simple] period.
  *
  * Every class above is RED-proven by the executable mutation battery
  * (scripts/check-guard-battery.mjs, run in `npm test`).
@@ -112,6 +124,17 @@ function walkKeys(node, path) {
 walkKeys(config, []);
 
 function checkDefaults(scope, label) {
+  // Trace-event re-enablers, forbidden at every scope: `logpush = true`
+  // persists trace events (console lines + request metadata) to a
+  // Logpush job, and `tail_consumers` streams the same events to another
+  // Worker — either one regresses the telemetry-off default while the
+  // observability keys below stay clean.
+  if (scope.logpush) {
+    fail(`wrangler.toml (${label}): logpush must not be enabled — trace events persist console lines and request metadata (stores-nothing)`);
+  }
+  if (Array.isArray(scope.tail_consumers) ? scope.tail_consumers.length > 0 : scope.tail_consumers !== undefined) {
+    fail(`wrangler.toml (${label}): tail_consumers must not be configured — trace events would stream to a Worker outside this audited repo`);
+  }
   const obs = scope.observability;
   if (label === "top-level") {
     if (!obs || obs.enabled !== false) {
@@ -155,6 +178,21 @@ const program = ts.createProgram([entry], {
   types: [],
 });
 
+// The bundle boundary must coincide with the audited boundary: wrangler
+// would happily bundle a module resolved outside the repo root, but the
+// per-file walk below only covers files under it — so an out-of-root
+// resolution fails loudly instead of silently escaping the audit
+// (node_modules and the TS default libs are the documented exclusions).
+for (const sf of program.getSourceFiles()) {
+  if (sf.fileName.includes("node_modules") || program.isSourceFileDefaultLibrary(sf)) continue;
+  if (!resolve(sf.fileName).startsWith(relayRoot + sep)) {
+    fail(
+      `${sf.fileName}: module resolves OUTSIDE the audited root — the bundler would include it ` +
+        "but the guard cannot audit it; move it under the repo",
+    );
+  }
+}
+
 const graphFiles = program
   .getSourceFiles()
   .filter((sf) => resolve(sf.fileName).startsWith(relayRoot + sep) && !sf.fileName.includes("node_modules"));
@@ -185,6 +223,13 @@ const FORBIDDEN_GLOBALS = new Set([
   "setTimeout",
   "setInterval",
   "globalThis",
+  // `self` is the idiomatic Workers global alias — without it in the set,
+  // `self.caches` / `self.setTimeout` / `self.eval` would all pass green
+  // (their property names sit in the exempted position below).
+  "self",
+  // `scheduler.wait()` is a timer in different clothing: it pins the DO
+  // awake exactly like setTimeout, which the no-timer guarantee forbids.
+  "scheduler",
   "eval",
   "Function",
   "Reflect",
@@ -351,10 +396,19 @@ for (const { sf, chk } of allFiles) {
       fail(`${loc(sf, node)}: dynamic import with a non-literal specifier escapes the audited graph`);
     }
     // (3) forbidden globals incl. reflection escape hatches + require.
+    // Property-name position is exempt (`obj.storage` is the MEMBER
+    // rule's job; `x.eval` on an ordinary receiver is someone else's
+    // method) — EXCEPT when the receiver is a global alias: de-aliasing
+    // through `self.`/`globalThis.` must not re-open a ban.
     if (ts.isIdentifier(node) && FORBIDDEN_GLOBALS.has(node.text)) {
       const p = node.parent;
+      const receiverIsGlobalAlias =
+        ts.isPropertyAccessExpression(p) &&
+        p.name === node &&
+        ts.isIdentifier(p.expression) &&
+        (p.expression.text === "self" || p.expression.text === "globalThis");
       const isDeclarationName =
-        (ts.isPropertyAccessExpression(p) && p.name === node) ||
+        (ts.isPropertyAccessExpression(p) && p.name === node && !receiverIsGlobalAlias) ||
         ts.isPropertySignature(p) ||
         ts.isMethodSignature(p);
       if (!isDeclarationName) {
@@ -435,6 +489,49 @@ for (const [name, expected, what] of DUAL_INTAKE) {
   if (declInits.get(name) !== expected) {
     fail(`contract constant ${name} (${what}) missing or drifted (found: ${declInits.get(name) ?? "absent"})`);
   }
+}
+
+// ====================== doc'd wire-version pins =======================
+// README.md and wrangler.toml both show example relay-authored frames.
+// Clients drop v-mismatched envelopes as unknown, so a stale `"v":N` in
+// an example silently loses frames for any implementer who copies it —
+// pin every doc'd literal to the WIRE_VERSION contract value.
+const WIRE_VERSION_EXPECTED = CONTRACT.find(([name]) => name === "WIRE_VERSION")[1];
+for (const docFile of ["README.md", "wrangler.toml"]) {
+  const docPath = join(relayRoot, docFile);
+  if (!existsSync(docPath)) {
+    fail(`${docFile} missing — the guard pins its example wire-version literals`);
+    continue;
+  }
+  for (const m of readFileSync(docPath, "utf8").matchAll(/"v"\s*:\s*(\d+)/g)) {
+    if (m[1] !== WIRE_VERSION_EXPECTED) {
+      fail(
+        `${docFile}: example wire version "v":${m[1]} drifted from WIRE_VERSION = ${WIRE_VERSION_EXPECTED} — ` +
+          "clients drop v-mismatched envelopes as unknown, so a copied example silently loses frames",
+      );
+    }
+  }
+}
+
+// =================== Retry-After ↔ limiter lockstep ===================
+// worker.ts advertises a retry hint on 429s; wrangler.toml's
+// [ratelimits.simple] period defines the actual window. Pin both sides
+// so neither can drift without a coordinated change.
+const retryAfterInit = declInits.get("RETRY_AFTER_SECONDS");
+if (retryAfterInit !== '"60"') {
+  fail(
+    `contract constant RETRY_AFTER_SECONDS (429 retry hint) missing or drifted (found: ${retryAfterInit ?? "absent"}) — ` +
+      "must stay in lockstep with wrangler.toml [ratelimits.simple] period",
+  );
+}
+const upgradesLimiter = (Array.isArray(config.ratelimits) ? config.ratelimits : []).find(
+  (r) => r && typeof r === "object" && r.name === "UPGRADES",
+);
+if (upgradesLimiter?.simple?.period !== 60) {
+  fail(
+    "wrangler.toml: [ratelimits.simple] period for UPGRADES missing or drifted from 60 — " +
+      "the 429 Retry-After hint in src/worker.ts (RETRY_AFTER_SECONDS) advertises this window",
+  );
 }
 
 // ============================== verdict ===============================

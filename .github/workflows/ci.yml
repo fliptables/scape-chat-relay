@@ -1,0 +1,21 @@
+# The build the README's "fails the build" claims refer to: invariant
+# guard + mutation battery + vitest suite (`npm test`), on every push to
+# main and every PR — for upstream and for forks.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
