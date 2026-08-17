@@ -8,7 +8,10 @@ import type { UpgradeRateLimiter } from "../src/env";
 // the limiter cannot be integration-tested through SELF.fetch here —
 // vitest.config.ts sets REQUIRE_UPGRADE_LIMITER="false" for that reason.
 // The full fail-open/fail-closed decision matrix is proven below against
-// stub limiters instead, and the "documents the runtime gap" test pins
+// stub limiters instead; the worker's mapping of those decisions onto
+// HTTP responses (503 limiter_misconfigured / 429 + Retry-After) is
+// covered in test/worker.spec.ts by calling the exported fetch handler
+// directly with stub envs. The "documents the runtime gap" test pins
 // the actual binding state so a future toolchain that DOES materialize
 // the binding flips it loudly (at which point add a real integration
 // test and drop the opt-out).

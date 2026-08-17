@@ -34,6 +34,11 @@ const ROOM_HEADER = "X-Scape-Room";
 const ROOM_ID = /^[0-9a-f]{64}$/;
 const ROUTE = /^\/room\/([0-9a-f]{64})$/;
 
+// Advisory client backoff hint on 429 — pinned by check-invariants.mjs
+// to wrangler.toml's [ratelimits.simple] period (the actual window), so
+// neither can drift without a coordinated change.
+const RETRY_AFTER_SECONDS = "60";
+
 /// Resolve the roomId from the dual intake, or undefined when the
 /// request matches neither mechanism (or matches both, inconsistently).
 function resolveRoomId(pathname: string, headerValue: string | null): string | undefined {
@@ -94,7 +99,7 @@ export default {
     if (decision === "reject_rate_limited") {
       return new Response("too many connection attempts", {
         status: 429,
-        headers: { "Retry-After": "60" },
+        headers: { "Retry-After": RETRY_AFTER_SECONDS },
       });
     }
     // idFromName is deterministic — same roomId → same DO instance, even

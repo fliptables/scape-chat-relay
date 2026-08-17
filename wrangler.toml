@@ -67,6 +67,7 @@ REQUIRE_UPGRADE_LIMITER = "true"
 # src/room.ts). The room egress budget bounds worst-case relay cost per
 # room: every accepted frame charges bytes × fanout against a token bucket;
 # on exhaustion the frame is dropped and the sender receives
-# {"v":1,"type":"error","code":"room_rate_limit"}.
+# {"v":2,"type":"error","code":"room_rate_limit","seq":N} (the wire version
+# in this example is pinned to WIRE_VERSION by check-invariants.mjs).
 # ROOM_EGRESS_CAPACITY_BYTES = "20971520"        # burst: 20 MiB
 # ROOM_EGRESS_REFILL_BYTES_PER_SEC = "10485760"  # sustained: 10 MiB/s

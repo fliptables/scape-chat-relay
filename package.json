@@ -4,7 +4,7 @@
   "private": true,
   "description": "End-to-end-encrypted chat-room relay for Scape (Cloudflare Worker + Durable Objects).",
   "scripts": {
-    "deploy": "wrangler deploy",
+    "deploy": "npm run check && wrangler deploy",
     "dev": "wrangler dev",
     "test": "npm run check && node scripts/check-guard-battery.mjs && vitest run",
     "check": "node scripts/check-invariants.mjs && node scripts/check-swift-contract.mjs",

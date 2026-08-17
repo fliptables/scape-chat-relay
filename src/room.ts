@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { upgradeIncludesWebSocket } from "./http";
@@ -29,8 +30,9 @@ import {
 /// - Decode envelopes (forwards opaque text frames; the client owns the
 ///   protocol — the one reserved literal is the "ping" keepalive below)
 /// - Persist messages (frames forwarded, then forgotten; the only state
-///   that survives hibernation is the 2-number rate-limit bucket on each
-///   socket attachment — see STORES-NOTHING notes in wrangler.toml)
+///   that survives hibernation is the 3-number connection state on each
+///   socket attachment — rate-limit bucket plus the ack `seq` counter —
+///   see STORES-NOTHING notes in wrangler.toml)
 
 const MAX_FRAME_BYTES = 64 * 1024;
 // Hard ceiling on per-room fanout. Beacons + messages fan out to every
@@ -242,11 +244,10 @@ export class RoomDurableObject extends DurableObject<Env> {
     }
     // Frame cap, allocation-safe. UTF-8 length ≥ UTF-16 code-unit count
     // for every valid JS string, so any string longer than the cap in
-    // code units is over the cap in bytes — reject it BEFORE encoding.
-    // (The platform accepts multi-MiB messages; measuring one via
-    // TextEncoder first would duplicate the attacker's payload into a
-    // second huge allocation. This ordering bounds the encode below to
-    // ≤ 64 Ki code units → ≤ 256 KiB output.)
+    // code units is over the cap in bytes — reject it BEFORE measuring.
+    // (The platform accepts multi-MiB messages; this ordering bounds the
+    // byte count below to a ≤ 64 Ki-code-unit walk instead of a scan of
+    // the attacker's whole payload.)
     if (msg.length > MAX_FRAME_BYTES) {
       persistConn(ws, att, seq);
       tell(rejectFrame("payload_too_large", seq));
@@ -255,9 +256,14 @@ export class RoomDurableObject extends DurableObject<Env> {
     }
     // Exact byte measurement: needed both for the cap (multi-byte
     // UTF-8 can cross it at ≤ 64 Ki code units) and for byte-accurate
-    // egress charging below. All legitimate traffic is ASCII JSON
+    // egress charging below. Buffer.byteLength counts WITHOUT
+    // materializing the encoded bytes — fanout sends the original
+    // string, so encoding here would allocate up to 192 KiB of
+    // immediate garbage per accepted frame on the hot path. Byte-exact
+    // with TextEncoder (both count an unpaired surrogate as the 3-byte
+    // replacement char); all legitimate traffic is ASCII JSON
     // (base64url ciphertext), so bytes ≈ code units in practice.
-    const byteLen = ENCODER.encode(msg).byteLength;
+    const byteLen = Buffer.byteLength(msg, "utf8");
     if (byteLen > MAX_FRAME_BYTES) {
       persistConn(ws, att, seq);
       tell(rejectFrame("payload_too_large", seq));
