@@ -57,12 +57,17 @@ describe("worker mapping of admission decisions onto HTTP responses", () => {
       },
     };
     const sentinel = new Response("do-reached");
+    const names: string[] = [];
     const rooms = {
-      idFromName: (name: string) => name,
+      idFromName: (name: string) => {
+        names.push(name);
+        return name;
+      },
       get: () => ({ fetch: async () => sentinel }),
     } as unknown as Env["ROOMS"];
     const res = await worker.fetch(connectRequest(), stubEnv({ UPGRADES: allow, ROOMS: rooms }));
     expect(res).toBe(sentinel);
     expect(keys).toEqual(["203.0.113.7"]);
+    expect(names).toEqual([ROOM]);
   });
 });

@@ -23,6 +23,11 @@
  *     bundler would include it but the audit below couldn't see it
  *     (node_modules and the TS default libs are the documented
  *     exclusions; deliberately out of scope, see "not a sandbox").
+ *     node_modules is recognized only as an exact path segment, so a
+ *     look-alike filename ("node_modules-escape.ts") can't borrow the
+ *     exclusion. The node:timers / node:timers/promises modules are
+ *     banned in every import form — a namespace import would otherwise
+ *     hide setTimeout/setInterval in property-name position.
  *  3. Console output is CENTRALIZED: `console` may appear only in
  *     src/log.ts, whose four call shapes are verified structurally and
  *     whose two sanitizers are pinned to RUNTIME-semantic bodies —
@@ -35,7 +40,8 @@
  *     `console` reference fails. The runtime behavior itself is proven
  *     by tainted-input unit tests in test/log.spec.ts.
  *  4. Reflection/global escape hatches are banned in the graph:
- *     globalThis, self, scheduler, Reflect, eval, Function, require.
+ *     globalThis, self, scheduler, setImmediate, Reflect, eval,
+ *     Function, require.
  *     The property-name exemption is revoked when the receiver is
  *     `self`/`globalThis`, so `self.eval(...)` / `globalThis.setTimeout`
  *     cannot slip through as "property names" — de-aliasing the global
@@ -178,13 +184,18 @@ const program = ts.createProgram([entry], {
   types: [],
 });
 
+// node_modules must match as an exact path SEGMENT, never a substring —
+// `includes("node_modules")` would let a file named node_modules-escape.ts
+// borrow the exclusion (codex round-4 finding).
+const inNodeModules = (fileName) => fileName.split(/[\\/]/).includes("node_modules");
+
 // The bundle boundary must coincide with the audited boundary: wrangler
 // would happily bundle a module resolved outside the repo root, but the
 // per-file walk below only covers files under it — so an out-of-root
 // resolution fails loudly instead of silently escaping the audit
 // (node_modules and the TS default libs are the documented exclusions).
 for (const sf of program.getSourceFiles()) {
-  if (sf.fileName.includes("node_modules") || program.isSourceFileDefaultLibrary(sf)) continue;
+  if (inNodeModules(sf.fileName) || program.isSourceFileDefaultLibrary(sf)) continue;
   if (!resolve(sf.fileName).startsWith(relayRoot + sep)) {
     fail(
       `${sf.fileName}: module resolves OUTSIDE the audited root — the bundler would include it ` +
@@ -195,7 +206,7 @@ for (const sf of program.getSourceFiles()) {
 
 const graphFiles = program
   .getSourceFiles()
-  .filter((sf) => resolve(sf.fileName).startsWith(relayRoot + sep) && !sf.fileName.includes("node_modules"));
+  .filter((sf) => resolve(sf.fileName).startsWith(relayRoot + sep) && !inNodeModules(sf.fileName));
 const graphPaths = new Set(graphFiles.map((sf) => resolve(sf.fileName)));
 const srcOnly = readdirSync(join(relayRoot, "src"), { recursive: true, withFileTypes: true })
   .filter((d) => d.isFile() && d.name.endsWith(".ts"))
@@ -222,6 +233,9 @@ const FORBIDDEN_GLOBALS = new Set([
   "caches",
   "setTimeout",
   "setInterval",
+  // setImmediate ships as a global under nodejs_compat — same timer
+  // family, same DO-pinning concern.
+  "setImmediate",
   "globalThis",
   // `self` is the idiomatic Workers global alias — without it in the set,
   // `self.caches` / `self.setTimeout` / `self.eval` would all pass green
@@ -235,6 +249,13 @@ const FORBIDDEN_GLOBALS = new Set([
   "Reflect",
   "require",
 ]);
+// Timer MODULES, banned in every import form (static, re-export,
+// dynamic): nodejs_compat exposes node:timers / node:timers/promises in
+// workerd, and a namespace import (`import * as t from "node:timers"`)
+// would put setTimeout/setInterval in the exempted property-name
+// position — outside the identifier ban above (codex round-4 finding).
+const FORBIDDEN_MODULE_SPECIFIERS = /^(node:)?timers(\/promises)?$/;
+
 const LOGGER_MODULE = resolve(relayRoot, "src", "log.ts");
 
 function rel(sf) {
@@ -394,6 +415,20 @@ for (const { sf, chk } of allFiles) {
       stringValueOf(node.arguments[0]) === null
     ) {
       fail(`${loc(sf, node)}: dynamic import with a non-literal specifier escapes the audited graph`);
+    }
+    // (2b) timer modules — see FORBIDDEN_MODULE_SPECIFIERS.
+    const moduleSpec = ts.isImportDeclaration(node)
+      ? stringValueOf(node.moduleSpecifier)
+      : ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined
+        ? stringValueOf(node.moduleSpecifier)
+        : ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword
+          ? stringValueOf(node.arguments[0])
+          : null;
+    if (moduleSpec !== null && FORBIDDEN_MODULE_SPECIFIERS.test(moduleSpec)) {
+      fail(
+        `${loc(sf, node)}: forbidden timer-module import "${moduleSpec}" — ` +
+          "node:timers re-exposes setTimeout/setInterval behind a namespace receiver (no-timers)",
+      );
     }
     // (3) forbidden globals incl. reflection escape hatches + require.
     // Property-name position is exempt (`obj.storage` is the MEMBER

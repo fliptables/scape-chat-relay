@@ -11,11 +11,12 @@
  * Classes: the original 9 drift mutations, the 5 first-round codex
  * bypasses, the 3 second-round codex evasions (fake errClass helper,
  * static require escaping the TS graph, const-literal computed storage
- * keys), and the review-round additions (self/scheduler global aliases,
+ * keys), the review-round additions (self/scheduler global aliases,
  * one bare mutation per banned reflection/timer name, out-of-root module
  * resolution, logpush/tail_consumers, doc'd wire-version drift,
- * Retry-After ↔ limiter-period lockstep) plus adjacent variants — each
- * RED-proven individually.
+ * Retry-After ↔ limiter-period lockstep), and the codex round-4 closures
+ * (timer-module namespace imports, node_modules-segment spoofing) plus
+ * adjacent variants — each RED-proven individually.
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -196,6 +197,28 @@ const MUTATIONS = [
     sed("wrangler.toml", "period = 60", "period = 120")],
   ["RA2 Retry-After hint drifts from the limiter period", () =>
     sed("src/worker.ts", 'RETRY_AFTER_SECONDS = "60"', 'RETRY_AFTER_SECONDS = "45"')],
+  // ---- codex round-4: timer MODULES. A namespace import hides
+  //      setTimeout in property-name position, so the specifier itself
+  //      must be banned — S2/R2 do not cover this path. ----
+  ["TM1 namespace import of node:timers", () => append("src/worker.ts",
+    'import * as timers from "node:timers";\nexport const tm1 = (f: () => void) => timers.setTimeout(f, 1000);\n')],
+  ["TM2 namespace import of node:timers/promises", () => append("src/worker.ts",
+    'import * as tp from "node:timers/promises";\nexport const tm2 = () => tp.setTimeout(1000);\n')],
+  ["R8 bare setImmediate", () => append("src/worker.ts",
+    "export const r8 = (f: () => void) => setImmediate(f);\n")],
+  // R9 isolates the `self` FORBIDDEN_GLOBALS entry from the
+  // receiver-de-alias branch: S1–S3 would stay RED through that branch
+  // even if `self` were dropped from the set, but a BARE `self` (no
+  // property access) is caught only by the set entry itself.
+  ["R9 bare self", () => append("src/worker.ts",
+    "export const r9 = () => self;\n")],
+  // ---- codex round-4: the node_modules exclusion must match an exact
+  //      path segment — a look-alike FILENAME outside the root must not
+  //      borrow it. Innocuous content, same isolation rationale as B6. ----
+  ["B7 out-of-root module named to spoof the node_modules exclusion", () => {
+    writeFileSync(join(work, "node_modules-escape.ts"), "export const escaped = 2;\n");
+    append("src/worker.ts", 'import { escaped as esc2 } from "../../node_modules-escape";\nexport const b7 = esc2;\n');
+  }],
 ];
 
 resetCopy();
