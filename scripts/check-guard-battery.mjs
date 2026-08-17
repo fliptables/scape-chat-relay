@@ -18,9 +18,9 @@
  * (timer-module namespace imports, node_modules-segment spoofing), and
  * the codex round-5 closures (import-equals, process/getBuiltinModule,
  * cloudflare:workers namespace de-aliasing), and the codex round-6
- * closures (AbortSignal.timeout, string-literal import spellings, and
- * round-7's constructor laundering) plus adjacent variants — each
- * RED-proven individually.
+ * closures (AbortSignal.timeout, string-literal import spellings,
+ * round-7's constructor laundering, and round-8's descriptor/prototype
+ * laundering) plus adjacent variants — each RED-proven individually.
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -255,6 +255,20 @@ const MUTATIONS = [
   //      banned; `timeout` sits in exempt property position). ----
   ["AS2 constructor laundering via req.signal", () => append("src/worker.ts",
     "export const as2 = (req: Request) => (req.signal.constructor as any).timeout(1000);\n")],
+  // ---- codex round-8: descriptor-based laundering. "constructor" is a
+  //      string ARGUMENT here, so only the reflection-primitive member
+  //      bans can catch it. AS3 is the end-to-end repro; RF1–RF4 isolate
+  //      each newly banned member. ----
+  ["AS3 descriptor laundering via getOwnPropertyDescriptor", () => append("src/worker.ts",
+    'export const as3 = (req: Request) => (Object.getOwnPropertyDescriptor(Object.getPrototypeOf(req.signal), "constructor") as any).value.timeout(1000);\n')],
+  ["RF1 Object.getPrototypeOf", () => append("src/worker.ts",
+    "export const rf1 = (x: object) => Object.getPrototypeOf(x);\n")],
+  ["RF2 getOwnPropertyDescriptor", () => append("src/worker.ts",
+    'export const rf2 = (x: object) => Object.getOwnPropertyDescriptor(x, "k");\n')],
+  ["RF3 getOwnPropertyDescriptors", () => append("src/worker.ts",
+    "export const rf3 = (x: object) => Object.getOwnPropertyDescriptors(x);\n")],
+  ["RF4 legacy __proto__ accessor", () => append("src/worker.ts",
+    "export const rf4 = (x: object) => (x as any).__proto__;\n")],
 ];
 
 resetCopy();

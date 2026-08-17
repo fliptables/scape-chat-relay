@@ -46,11 +46,14 @@
  *  4. Reflection/global escape hatches are banned in the graph:
  *     globalThis, self, scheduler, setImmediate, process, AbortSignal
  *     (AbortSignal.timeout is a timer), Reflect, eval, Function,
- *     require — plus the getBuiltinModule and `constructor` members on
- *     any receiver (constructor laundering recovers banned constructors
- *     — req.signal.constructor → AbortSignal, fn.constructor →
- *     Function — without naming them), and string-literal import
- *     spellings (`import { "scheduler" as x }`) of any banned name.
+ *     require — plus, on any receiver, the getBuiltinModule,
+ *     `constructor`, getPrototypeOf, getOwnPropertyDescriptor(s), and
+ *     `__proto__` members (constructor/descriptor laundering recovers
+ *     banned constructors — req.signal.constructor → AbortSignal,
+ *     fn.constructor → Function — without naming them), and
+ *     string-literal import spellings (`import { "scheduler" as x }`)
+ *     of any banned name. Descriptor/name ENUMERATION with heuristic
+ *     selection is documented out of scope ("not a sandbox").
  *     The property-name exemption is revoked when the receiver is
  *     `self`/`globalThis`, so `self.eval(...)` / `globalThis.setTimeout`
  *     cannot slip through as "property names" — de-aliasing the global
@@ -246,6 +249,15 @@ if (allFiles.length < 5) {
 // recovers Function — without ever naming the banned global (codex
 // round-7 finding). The property/computed/destructuring machinery below
 // covers aliased and quoted forms automatically.
+// Descriptor/prototype primitives (codex round-8): with `.constructor`
+// banned, `Object.getOwnPropertyDescriptor(Object.getPrototypeOf(x),
+// "constructor").value` still recovered a banned constructor — the name
+// is a mere string ARGUMENT there, invisible to the member rules. Ban
+// the primitives themselves (getPrototypeOf / getOwnPropertyDescriptor
+// / getOwnPropertyDescriptors, plus legacy `__proto__`). Name/descriptor
+// ENUMERATION (getOwnPropertyNames + heuristic selection) is left to
+// the documented "not a sandbox" boundary: it requires deliberately
+// avoiding the name being selected, which is obfuscation, not drift.
 const FORBIDDEN_MEMBERS = new Set([
   "storage",
   "setAlarm",
@@ -253,6 +265,10 @@ const FORBIDDEN_MEMBERS = new Set([
   "deleteAlarm",
   "getBuiltinModule",
   "constructor",
+  "getPrototypeOf",
+  "getOwnPropertyDescriptor",
+  "getOwnPropertyDescriptors",
+  "__proto__",
 ]);
 const FORBIDDEN_GLOBALS = new Set([
   "caches",
