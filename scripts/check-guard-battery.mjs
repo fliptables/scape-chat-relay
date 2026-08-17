@@ -18,8 +18,9 @@
  * (timer-module namespace imports, node_modules-segment spoofing), and
  * the codex round-5 closures (import-equals, process/getBuiltinModule,
  * cloudflare:workers namespace de-aliasing), and the codex round-6
- * closures (AbortSignal.timeout, string-literal import spellings) plus
- * adjacent variants — each RED-proven individually.
+ * closures (AbortSignal.timeout, string-literal import spellings, and
+ * round-7's constructor laundering) plus adjacent variants — each
+ * RED-proven individually.
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -248,6 +249,12 @@ const MUTATIONS = [
   // is satisfied, and `delayed.wait` sits in exempt property position).
   ["CW3 quoted named import of scheduler", () => append("src/worker.ts",
     'import { "scheduler" as delayed } from "cloudflare:workers";\nexport const cw3 = () => delayed.wait(1000);\n')],
+  // ---- codex round-7: constructor laundering — recovers the AbortSignal
+  //      constructor from the request signal without naming it. RED must
+  //      come from the `constructor` MEMBER ban alone (`signal` is not
+  //      banned; `timeout` sits in exempt property position). ----
+  ["AS2 constructor laundering via req.signal", () => append("src/worker.ts",
+    "export const as2 = (req: Request) => (req.signal.constructor as any).timeout(1000);\n")],
 ];
 
 resetCopy();

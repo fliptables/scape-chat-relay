@@ -46,9 +46,11 @@
  *  4. Reflection/global escape hatches are banned in the graph:
  *     globalThis, self, scheduler, setImmediate, process, AbortSignal
  *     (AbortSignal.timeout is a timer), Reflect, eval, Function,
- *     require — plus the getBuiltinModule member on any receiver, and
- *     string-literal import spellings (`import { "scheduler" as x }`)
- *     of any banned name.
+ *     require — plus the getBuiltinModule and `constructor` members on
+ *     any receiver (constructor laundering recovers banned constructors
+ *     — req.signal.constructor → AbortSignal, fn.constructor →
+ *     Function — without naming them), and string-literal import
+ *     spellings (`import { "scheduler" as x }`) of any banned name.
  *     The property-name exemption is revoked when the receiver is
  *     `self`/`globalThis`, so `self.eval(...)` / `globalThis.setTimeout`
  *     cannot slip through as "property names" — de-aliasing the global
@@ -238,7 +240,20 @@ if (allFiles.length < 5) {
 // getBuiltinModule (on ANY receiver) re-exposes node builtins — incl.
 // node:timers — with no import for the graph rules to see; workerd
 // implements it under nodejs_compat (codex round-5 finding).
-const FORBIDDEN_MEMBERS = new Set(["storage", "setAlarm", "getAlarm", "deleteAlarm", "getBuiltinModule"]);
+// `constructor` (as MEMBER ACCESS, not the class-body declaration, which
+// is a different AST node) closes constructor laundering: e.g.
+// `req.signal.constructor` recovers AbortSignal — and `fn.constructor`
+// recovers Function — without ever naming the banned global (codex
+// round-7 finding). The property/computed/destructuring machinery below
+// covers aliased and quoted forms automatically.
+const FORBIDDEN_MEMBERS = new Set([
+  "storage",
+  "setAlarm",
+  "getAlarm",
+  "deleteAlarm",
+  "getBuiltinModule",
+  "constructor",
+]);
 const FORBIDDEN_GLOBALS = new Set([
   "caches",
   "setTimeout",
