@@ -17,8 +17,9 @@
  * Retry-After ↔ limiter-period lockstep), the codex round-4 closures
  * (timer-module namespace imports, node_modules-segment spoofing), and
  * the codex round-5 closures (import-equals, process/getBuiltinModule,
- * cloudflare:workers namespace de-aliasing) plus adjacent variants —
- * each RED-proven individually.
+ * cloudflare:workers namespace de-aliasing), and the codex round-6
+ * closures (AbortSignal.timeout, string-literal import spellings) plus
+ * adjacent variants — each RED-proven individually.
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -239,6 +240,14 @@ const MUTATIONS = [
     'import * as w from "cloudflare:workers";\nexport const cw1 = () => w.scheduler.wait(1000);\n')],
   ["CW2 dynamic import of cloudflare:workers", () => append("src/worker.ts",
     'export const cw2 = () => import("cloudflare:workers");\n')],
+  // ---- codex round-6: last two timer paths ----
+  ["AS1 AbortSignal.timeout timer", () => append("src/worker.ts",
+    'export const as1 = (ms: number) => new Promise((resolve) => AbortSignal.timeout(ms).addEventListener("abort", resolve, { once: true }));\n')],
+  // CW3 spells the banned name as a STRING literal, which the identifier
+  // ban cannot see — isolates the import/export-spelling rule (namedOnly
+  // is satisfied, and `delayed.wait` sits in exempt property position).
+  ["CW3 quoted named import of scheduler", () => append("src/worker.ts",
+    'import { "scheduler" as delayed } from "cloudflare:workers";\nexport const cw3 = () => delayed.wait(1000);\n')],
 ];
 
 resetCopy();

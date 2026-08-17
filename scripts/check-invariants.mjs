@@ -44,9 +44,11 @@
  *     `console` reference fails. The runtime behavior itself is proven
  *     by tainted-input unit tests in test/log.spec.ts.
  *  4. Reflection/global escape hatches are banned in the graph:
- *     globalThis, self, scheduler, setImmediate, process, Reflect,
- *     eval, Function, require — plus the getBuiltinModule member on
- *     any receiver.
+ *     globalThis, self, scheduler, setImmediate, process, AbortSignal
+ *     (AbortSignal.timeout is a timer), Reflect, eval, Function,
+ *     require — plus the getBuiltinModule member on any receiver, and
+ *     string-literal import spellings (`import { "scheduler" as x }`)
+ *     of any banned name.
  *     The property-name exemption is revoked when the receiver is
  *     `self`/`globalThis`, so `self.eval(...)` / `globalThis.setTimeout`
  *     cannot slip through as "property names" — de-aliasing the global
@@ -255,6 +257,10 @@ const FORBIDDEN_GLOBALS = new Set([
   // `process.getBuiltinModule("node:timers")` re-exposes timers with no
   // import at all; nothing in a bindings-based Worker needs `process`.
   "process",
+  // `AbortSignal.timeout(ms)` is a standards-track timer with no module
+  // and no otherwise-banned name; the relay never aborts anything, so
+  // the whole global goes rather than the common property name "timeout".
+  "AbortSignal",
   "eval",
   "Function",
   "Reflect",
@@ -450,6 +456,21 @@ for (const { sf, chk } of allFiles) {
           "node:timers re-exposes setTimeout/setInterval behind a namespace receiver, and " +
           "node:process re-exposes every builtin via getBuiltinModule (no-timers)",
       );
+    }
+    // (2d′) string-literal import/export spellings: `import { "scheduler"
+    // as x }` is valid modern syntax that carries the imported name as a
+    // StringLiteral — invisible to the identifier ban, which only sees
+    // Identifier nodes (codex round-6 finding). Check both the imported
+    // (propertyName) and local/exported (name) spellings.
+    if (ts.isImportSpecifier(node) || ts.isExportSpecifier(node)) {
+      for (const nameNode of [node.propertyName, node.name]) {
+        if (nameNode !== undefined && ts.isStringLiteralLike(nameNode) && FORBIDDEN_GLOBALS.has(nameNode.text)) {
+          fail(
+            `${loc(sf, node)}: string-literal import/export spelling of forbidden name "${nameNode.text}" — ` +
+              "quoting a banned name must not evade the identifier ban",
+          );
+        }
+      }
     }
     // (2d) cloudflare:workers may be imported ONLY via named bindings:
     // its module namespace object re-exports `scheduler`, so a
